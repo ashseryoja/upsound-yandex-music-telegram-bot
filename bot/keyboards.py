@@ -15,7 +15,7 @@ def track_keyboard(url: str) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🔗 Open in Yandex Music",
+                    text="🔗 Открыть в Яндекс Музыке",
                     url=url,
                 )
             ],
