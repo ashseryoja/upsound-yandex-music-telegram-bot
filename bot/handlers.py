@@ -89,6 +89,22 @@ async def handle_yandex_link(message: types.Message) -> None:
             reply_markup=track_keyboard(text),
         )
 
+        # Step 4 — send lyrics as a separate blockquote if available
+        lyrics: Optional[str] = info.get("lyrics")
+        if lyrics:
+            # Telegram HTML <blockquote> is supported in Bot API 7.3+
+            # Escape HTML entities in lyrics text to avoid injection
+            safe_lyrics = (
+                lyrics
+                .replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+            )
+            await message.reply(
+                f"📝 <b>Lyrics</b>\n\n<blockquote>{safe_lyrics}</blockquote>",
+                parse_mode=ParseMode.HTML,
+            )
+
         logger.info(
             "Served track_id=%s to user_id=%s (@%s)",
             track_id,
@@ -105,11 +121,19 @@ async def handle_yandex_link(message: types.Message) -> None:
     # Block 2: log analytics to Supabase (isolated — never affects user)
     # ------------------------------------------------------------------
     try:
+        # CRITICAL: strip lyrics before sending to Supabase —
+        # only title, artist, and duration go to the DB.
+        db_info = {
+            "title": info["title"],
+            "artist": info["artist"],
+            "duration": info["duration"],
+        }
+
         await log_request(
             user_id=user.id if user else 0,
             username=user.username if user else None,
             track_url=text,
-            track_info=info,
+            track_info=db_info,
         )
     except Exception as exc:  # noqa: BLE001
         # Should never reach here — log_request has its own internal guard.

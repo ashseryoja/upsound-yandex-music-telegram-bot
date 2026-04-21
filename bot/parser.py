@@ -7,9 +7,8 @@ Uses **direct HTTP requests** (aiohttp) to the Yandex Music web-player
 handler endpoint (``/handlers/track.jsx``) which returns rich JSON
 including title, artists, and duration — without authentication.
 
-This endpoint works reliably from any IP (including Vercel serverless)
-because it is the same endpoint the web frontend uses for rendering
-track pages.
+Lyrics are fetched via a separate ``/tracks/<id>/supplement`` API call
+when the handler response indicates they are available.
 
 A fallback to the ``api.music.yandex.net/tracks`` internal API is
 provided in case the handler endpoint becomes unavailable.
@@ -35,8 +34,8 @@ YANDEX_TRACK_PATTERN = re.compile(r"track/(\d+)")
 # HTTP configuration
 # ---------------------------------------------------------------------------
 _HANDLER_URL = "https://music.yandex.ru/handlers/track.jsx"
-
 _API_URL = "https://api.music.yandex.net/tracks"
+_SUPPLEMENT_URL = "https://api.music.yandex.net/tracks/{track_id}/supplement"
 
 _BROWSER_HEADERS = {
     "User-Agent": (
@@ -76,10 +75,15 @@ def extract_track_id(url: str) -> Optional[str]:
 
 
 async def fetch_track_info(track_id: str) -> Optional[dict]:
-    """Fetch track metadata.
+    """Fetch track metadata including lyrics if available.
 
-    Returns ``{"title": str, "artist": str, "duration": "MM:SS"}`` on
-    success, or ``None`` when every retrieval strategy fails.
+    Returns a dict with keys:
+    - ``title``    (str)           — track title
+    - ``artist``   (str)           — comma-separated artist names
+    - ``duration`` (str)           — formatted as ``MM:SS``
+    - ``lyrics``   (str | None)    — full lyrics text, or None
+
+    Returns ``None`` when every retrieval strategy fails.
     """
     # Strategy 1 — handlers/track.jsx (web-player endpoint, most reliable)
     info = await _fetch_via_handler(track_id)
@@ -139,7 +143,14 @@ async def _fetch_via_handler(track_id: str) -> Optional[dict]:
                     )
                     return None
 
-                return _parse_track(track)
+                result = _parse_track(track)
+
+                # Check if lyrics are available and fetch them
+                lyrics_info = track.get("lyricsInfo", {})
+                if lyrics_info.get("hasAvailableTextLyrics"):
+                    result["lyrics"] = await _fetch_lyrics(track_id)
+
+                return result
 
     except (json.JSONDecodeError, aiohttp.ContentTypeError) as exc:
         logger.warning("Handler JSON decode error for track_id=%s: %s", track_id, exc)
@@ -184,6 +195,38 @@ async def _fetch_via_api(track_id: str) -> Optional[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Lyrics fetcher
+# ---------------------------------------------------------------------------
+
+async def _fetch_lyrics(track_id: str) -> Optional[str]:
+    """GET /tracks/<id>/supplement to retrieve full lyrics text."""
+    url = _SUPPLEMENT_URL.format(track_id=track_id)
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                url,
+                headers=_API_HEADERS,
+                timeout=_TIMEOUT,
+            ) as resp:
+                if resp.status != 200:
+                    logger.warning(
+                        "Supplement API returned HTTP %d for track_id=%s",
+                        resp.status,
+                        track_id,
+                    )
+                    return None
+
+                data = await resp.json()
+                lyrics_obj = data.get("result", {}).get("lyrics", {})
+                full_text = lyrics_obj.get("fullLyrics", "").strip()
+                return full_text or None
+
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Lyrics fetch failed for track_id=%s: %s", track_id, exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Shared track parser
 # ---------------------------------------------------------------------------
 
@@ -192,6 +235,9 @@ def _parse_track(track: dict) -> dict:
 
     Works with both handler and API response shapes — both use the same
     field names (``title``, ``artists``, ``durationMs``).
+
+    The ``lyrics`` key defaults to ``None``; it is populated separately
+    by the caller when lyrics are available.
     """
     # Duration: ms → MM:SS
     duration_ms: int = track.get("durationMs", 0)
@@ -208,4 +254,5 @@ def _parse_track(track: dict) -> dict:
         "title": track.get("title") or "Unknown title",
         "artist": artists or "Unknown artist",
         "duration": f"{minutes:02d}:{seconds:02d}",
+        "lyrics": None,
     }
