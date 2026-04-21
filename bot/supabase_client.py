@@ -40,7 +40,7 @@ def _get_client() -> Client:
     """
     global _client  # noqa: PLW0603
     if _client is None:
-        url = os.environ.get("SUPABASE_URL", "").strip()
+        url = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
         key = os.environ.get("SUPABASE_KEY", "").strip()
 
         if not url or not key:
@@ -49,7 +49,7 @@ def _get_client() -> Client:
             )
 
         _client = create_client(url, key)
-        logger.info("Supabase client initialised (url=%s...)", url[:30])
+        logger.info("Supabase client initialised (url=%s...)", url[:40])
 
     return _client
 
