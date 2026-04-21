@@ -21,25 +21,22 @@ from yandex_music.exceptions import YandexMusicError
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Regex — matches both known Yandex Music track URL shapes
+# Regex — extracts the numeric track ID from any Yandex Music URL
 # ---------------------------------------------------------------------------
-YANDEX_TRACK_PATTERN = re.compile(
-    r"music\.yandex\.(?:ru|com)/album/\d+/track/(\d+)"
-    r"|"
-    r"music\.yandex\.(?:ru|com)/track/(\d+)"
-)
+YANDEX_TRACK_PATTERN = re.compile(r"track/(\d+)")
 
 
 def extract_track_id(url: str) -> Optional[str]:
     """Return the numeric track ID from a Yandex Music URL.
 
-    Returns ``None`` when the URL does not match a known format.
+    Works with any URL shape (album/track, direct /track, mobile share links
+    with query parameters and UTM tags).  Returns ``None`` when no track ID
+    can be found.
     """
     match = YANDEX_TRACK_PATTERN.search(url)
     if not match:
         return None
-    # group(1) — album/track variant; group(2) — direct track variant
-    return match.group(1) or match.group(2)
+    return match.group(1)
 
 
 async def fetch_track_info(track_id: str) -> Optional[dict]:

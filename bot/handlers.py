@@ -44,7 +44,7 @@ async def handle_start(message: types.Message) -> None:
 # Yandex Music track link handler
 # ---------------------------------------------------------------------------
 
-@router.message(F.text.regexp(r"music\.yandex\.(ru|com)"))
+@router.message(F.text.contains("music.yandex"))
 async def handle_yandex_link(message: types.Message) -> None:
     """Detect a Yandex Music URL, fetch metadata, and reply with a track card."""
     text: str = message.text or ""
