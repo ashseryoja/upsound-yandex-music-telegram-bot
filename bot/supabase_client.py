@@ -1,18 +1,24 @@
 """
 bot/supabase_client.py
 ~~~~~~~~~~~~~~~~~~~~~~
-Thin async wrapper around supabase-py for fire-and-forget analytics logging.
+Analytics logging to Supabase for every track request.
 
-The client is created once (module-level singleton) and reused across
-invocations within the same Vercel function instance.
-
-All writes are best-effort: any exception is caught and logged so that a
-Supabase outage can never crash or delay the bot response.
+Design for Vercel serverless:
+- supabase-py is fully SYNCHRONOUS. We call it directly — no executor,
+  no asyncio bridging.
+- In our serverless setup, the entire async graph runs under asyncio.run()
+  which blocks the Vercel worker thread until all coroutines complete,
+  so calling a synchronous function inside an async function is safe and
+  correct here (the event loop is not shared with any other work).
+- The Supabase client is created lazily on first call (module-level
+  singleton) so it survives warm container reuse.
+- Every insert is wrapped in its own try/except with explicit structured
+  logging so failures are always visible in Vercel logs.
 """
 
 from __future__ import annotations
 
-import asyncio
+import json
 import logging
 import os
 from typing import Optional
@@ -28,11 +34,14 @@ _client: Optional[Client] = None
 
 
 def _get_client() -> Client:
-    """Return (or create) the shared Supabase client."""
+    """Return (or create) the shared Supabase client.
+
+    Raises ``RuntimeError`` if the required env vars are absent.
+    """
     global _client  # noqa: PLW0603
     if _client is None:
-        url = os.environ.get("SUPABASE_URL", "")
-        key = os.environ.get("SUPABASE_KEY", "")
+        url = os.environ.get("SUPABASE_URL", "").strip()
+        key = os.environ.get("SUPABASE_KEY", "").strip()
 
         if not url or not key:
             raise RuntimeError(
@@ -40,6 +49,8 @@ def _get_client() -> Client:
             )
 
         _client = create_client(url, key)
+        logger.info("Supabase client initialised (url=%s...)", url[:30])
+
     return _client
 
 
@@ -51,31 +62,64 @@ async def log_request(
 ) -> None:
     """Insert one analytics row into the ``requests`` table.
 
-    Runs the synchronous supabase-py call in a thread pool so it does not
-    block the event loop.  The whole operation is wrapped in a try/except so
-    that any failure (network, schema mismatch, bad credentials, …) is only
-    logged — never re-raised.
+    Payload matches the schema exactly:
+      - user_id   (int8)   — Telegram user ID
+      - username  (text)   — nullable Telegram @handle
+      - track_url (text)   — the raw URL the user sent
+      - track_info (jsonb) — {"title": ..., "artist": ..., "duration": ...}
+
+    The call is synchronous (supabase-py) and runs directly inside the
+    coroutine — safe because we execute under asyncio.run() on a dedicated
+    Vercel worker thread, so there is no shared long-running event loop to
+    block.
     """
     try:
         client = _get_client()
-
-        payload = {
-            "user_id": user_id,
-            "username": username,
-            "track_url": track_url,
-            "track_info": track_info,
-        }
-
-        # supabase-py execute() is synchronous — offload to a thread pool
-        # so the event loop stays unblocked.
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(
-            None,
-            lambda: client.table("requests").insert(payload).execute(),
-        )
-
     except RuntimeError as exc:
-        # Missing env vars — log once and give up
-        logger.error("Supabase client not configured: %s", exc)
+        logger.error("Supabase not configured, skipping log_request: %s", exc)
+        return
+
+    payload = {
+        "user_id": int(user_id),          # ensure int, not numpy/etc
+        "username": username or None,
+        "track_url": track_url,
+        "track_info": track_info,         # dict → jsonb via supabase-py
+    }
+
+    logger.info(
+        "Supabase insert starting: user_id=%s track_url=%s",
+        user_id,
+        track_url,
+    )
+
+    try:
+        response = (
+            client.table("requests")
+            .insert(payload)
+            .execute()
+        )
+        # supabase-py v2 returns a PostgrestAPIResponse with .data
+        rows = getattr(response, "data", None)
+        if rows:
+            logger.info(
+                "Supabase insert OK: inserted row id=%s",
+                rows[0].get("id", "?"),
+            )
+        else:
+            # Successful HTTP call but no rows returned — log the full response
+            logger.warning(
+                "Supabase insert returned no data. Full response: %s",
+                json.dumps(
+                    {"data": rows, "count": getattr(response, "count", None)},
+                    default=str,
+                ),
+            )
+
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Supabase log_request failed (non-fatal): %s", exc)
+        logger.error(
+            "Supabase insert FAILED for user_id=%s track_url=%s: %s",
+            user_id,
+            track_url,
+            exc,
+            exc_info=True,
+        )

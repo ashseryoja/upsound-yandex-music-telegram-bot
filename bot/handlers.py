@@ -11,6 +11,7 @@ analytics log to Supabase (best-effort, non-blocking).
 from __future__ import annotations
 
 import logging
+from typing import Optional
 
 from aiogram import F, Router, types
 from aiogram.enums import ParseMode
@@ -49,6 +50,13 @@ async def handle_yandex_link(message: types.Message) -> None:
     """Detect a Yandex Music URL, fetch metadata, and reply with a track card."""
     text: str = message.text or ""
 
+    # ------------------------------------------------------------------
+    # Block 1: fetch track metadata and reply to user
+    # ------------------------------------------------------------------
+    track_id: Optional[str] = None
+    info: Optional[dict] = None
+    user = message.from_user
+
     try:
         # Step 1 — extract track ID from URL
         track_id = extract_track_id(text)
@@ -81,15 +89,6 @@ async def handle_yandex_link(message: types.Message) -> None:
             reply_markup=track_keyboard(text),
         )
 
-        # Step 4 — fire-and-forget analytics (after the reply is already sent)
-        user = message.from_user
-        await log_request(
-            user_id=user.id if user else 0,
-            username=user.username if user else None,
-            track_url=text,
-            track_info=info,
-        )
-
         logger.info(
             "Served track_id=%s to user_id=%s (@%s)",
             track_id,
@@ -100,6 +99,21 @@ async def handle_yandex_link(message: types.Message) -> None:
     except Exception as exc:  # noqa: BLE001
         logger.error("Error handling Yandex link: %s", exc, exc_info=True)
         await message.reply("⚠️ Ошибка при поиске трека")
+        return  # skip analytics if the main flow failed
+
+    # ------------------------------------------------------------------
+    # Block 2: log analytics to Supabase (isolated — never affects user)
+    # ------------------------------------------------------------------
+    try:
+        await log_request(
+            user_id=user.id if user else 0,
+            username=user.username if user else None,
+            track_url=text,
+            track_info=info,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Should never reach here — log_request has its own internal guard.
+        logger.error("Unexpected error in log_request: %s", exc, exc_info=True)
 
 
 # ---------------------------------------------------------------------------
