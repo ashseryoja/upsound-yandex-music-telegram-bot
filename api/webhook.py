@@ -7,11 +7,11 @@ Vercel invokes this module as a Python WSGI/HTTP handler.  The class **must**
 be named ``handler`` (lowercase) for the @vercel/python runtime to pick it up.
 
 Design notes:
-- Bot and Dispatcher are module-level singletons so they are reused across
-  warm invocations (avoids re-creating them on every request).
-- asyncio.new_event_loop() is used instead of get_event_loop() because Vercel
-  serverless workers may not have a running loop in the thread that handles
-  the request.
+- Dispatcher is a module-level singleton — routers can be safely reused.
+- Bot is created per-request inside an ``async with`` block so the underlying
+  aiohttp session is always bound to the *current* event loop and closed
+  automatically.  This avoids the classic "Event loop is closed" error that
+  occurs when a global Bot outlives the loop that created it.
 - All exceptions are caught at the outermost level; a 500 is returned so
   Telegram retries the update later rather than silently dropping it.
 """
@@ -40,7 +40,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Bot / Dispatcher singletons
+# Configuration
 # ---------------------------------------------------------------------------
 _BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
@@ -48,17 +48,26 @@ if not _BOT_TOKEN:
     # Fail loudly at import time so Vercel build logs show a clear error.
     raise RuntimeError("BOT_TOKEN environment variable is not set.")
 
-bot = Bot(
-    token=_BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-)
-
+# Dispatcher is a global singleton — routers are stateless and reusable.
 dp = Dispatcher()
 
 # Register all application routers
 from bot.handlers import router as main_router  # noqa: E402 (import after setup)
 
 dp.include_router(main_router)
+
+
+# ---------------------------------------------------------------------------
+# Per-request handler — Bot is created and destroyed within a single update
+# ---------------------------------------------------------------------------
+
+async def _handle_update(update: Update) -> None:
+    """Create a short-lived Bot, process the update, then close the session."""
+    async with Bot(
+        token=_BOT_TOKEN,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    ) as bot:
+        await dp.feed_update(bot=bot, update=update)
 
 
 # ---------------------------------------------------------------------------
@@ -88,17 +97,11 @@ class handler(BaseHTTPRequestHandler):
             raw: dict = json.loads(body)
             update = Update.model_validate(raw)
 
-            # Run the async dispatcher in a fresh event loop.
-            # We must create a NEW loop every time because Vercel reuses
-            # the same process across warm invocations, and asyncio.run()
-            # closes the loop after completion — a subsequent call would
-            # hit "Event loop is closed".
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                loop.run_until_complete(dp.feed_update(bot=bot, update=update))
-            finally:
-                loop.close()
+            # asyncio.run() creates a fresh loop, runs the coroutine,
+            # then closes the loop.  Because the Bot is created *inside*
+            # _handle_update via ``async with``, its aiohttp session is
+            # always bound to this new loop — no stale-session issues.
+            asyncio.run(_handle_update(update))
 
             self._respond(200, b"ok")
 
