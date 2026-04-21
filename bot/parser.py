@@ -3,21 +3,21 @@ bot/parser.py
 ~~~~~~~~~~~~~
 URL parsing and Yandex Music track metadata fetching.
 
-Uses **direct HTTP requests** (aiohttp) instead of the ``yandex-music``
-library to avoid session / event-loop issues in serverless environments
-and to bypass geo-restrictions that affect the library's ``init()`` call
-from non-Russian IPs (e.g. Vercel).
+Uses **direct HTTP requests** (aiohttp) to the Yandex Music web-player
+handler endpoint (``/handlers/track.jsx``) which returns rich JSON
+including title, artists, and duration — without authentication.
 
-Two retrieval strategies are tried in order:
-1. **Yandex Music internal API** (``POST /tracks``) — fast, returns full
-   metadata including duration.
-2. **Page scraping** (OG meta-tags from the track page) — fallback when
-   the API is unreachable or geo-blocked.  Duration may not be available.
+This endpoint works reliably from any IP (including Vercel serverless)
+because it is the same endpoint the web frontend uses for rendering
+track pages.
+
+A fallback to the ``api.music.yandex.net/tracks`` internal API is
+provided in case the handler endpoint becomes unavailable.
 """
 
 from __future__ import annotations
 
-import html
+import json
 import logging
 import re
 from typing import Optional
@@ -34,23 +34,27 @@ YANDEX_TRACK_PATTERN = re.compile(r"track/(\d+)")
 # ---------------------------------------------------------------------------
 # HTTP configuration
 # ---------------------------------------------------------------------------
+_HANDLER_URL = "https://music.yandex.ru/handlers/track.jsx"
+
 _API_URL = "https://api.music.yandex.net/tracks"
+
+_BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Linux; Android 14; Pixel 7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/125.0.0.0 Mobile Safari/537.36"
+    ),
+    "Accept": "application/json, text/javascript, */*",
+    "Accept-Language": "ru-RU,ru;q=0.9",
+    "Referer": "https://music.yandex.ru/",
+    "X-Retpath-Y": "https://music.yandex.ru/",
+}
 
 _API_HEADERS = {
     "User-Agent": "YandexMusicAndroid/2024.09.2",
     "Accept": "application/json",
     "Accept-Language": "ru",
     "X-Yandex-Music-Client": "YandexMusicAndroid/2024.09.2",
-}
-
-_PAGE_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Linux; Android 14; Pixel 7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/125.0.0.0 Mobile Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml",
-    "Accept-Language": "ru-RU,ru;q=0.9",
 }
 
 _TIMEOUT = aiohttp.ClientTimeout(total=8)
@@ -77,30 +81,80 @@ async def fetch_track_info(track_id: str) -> Optional[dict]:
     Returns ``{"title": str, "artist": str, "duration": "MM:SS"}`` on
     success, or ``None`` when every retrieval strategy fails.
     """
-    # Strategy 1 — Yandex Music internal API (fast, full metadata)
-    info = await _fetch_via_api(track_id)
+    # Strategy 1 — handlers/track.jsx (web-player endpoint, most reliable)
+    info = await _fetch_via_handler(track_id)
     if info:
         return info
 
     logger.info(
-        "API unavailable for track_id=%s, falling back to page scraping",
+        "Handler endpoint failed for track_id=%s, trying internal API",
         track_id,
     )
 
-    # Strategy 2 — scrape OG tags from the track page (slower, no duration)
-    return await _fetch_via_page(track_id)
+    # Strategy 2 — api.music.yandex.net/tracks (mobile API fallback)
+    return await _fetch_via_api(track_id)
 
 
 # ---------------------------------------------------------------------------
-# Strategy 1: Direct API request
+# Strategy 1: Web-player handler endpoint (primary)
+# ---------------------------------------------------------------------------
+
+async def _fetch_via_handler(track_id: str) -> Optional[dict]:
+    """GET /handlers/track.jsx — the endpoint the web frontend uses.
+
+    Returns full JSON with the track object nested under the ``"track"`` key.
+    Works without authentication from any IP.
+    """
+    params = {
+        "track": track_id,
+        "lang": "ru",
+        "external-domain": "music.yandex.ru",
+        "overembed": "false",
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                _HANDLER_URL,
+                params=params,
+                headers=_BROWSER_HEADERS,
+                timeout=_TIMEOUT,
+            ) as resp:
+                if resp.status != 200:
+                    logger.warning(
+                        "Handler returned HTTP %d for track_id=%s",
+                        resp.status,
+                        track_id,
+                    )
+                    return None
+
+                data = await resp.json(content_type=None)
+
+                # The track object lives under the "track" key
+                track = data.get("track")
+                if not track:
+                    logger.warning(
+                        "Handler response has no 'track' key for track_id=%s",
+                        track_id,
+                    )
+                    return None
+
+                return _parse_track(track)
+
+    except (json.JSONDecodeError, aiohttp.ContentTypeError) as exc:
+        logger.warning("Handler JSON decode error for track_id=%s: %s", track_id, exc)
+        return None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Handler request failed for track_id=%s: %s", track_id, exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Strategy 2: Internal mobile API (fallback)
 # ---------------------------------------------------------------------------
 
 async def _fetch_via_api(track_id: str) -> Optional[dict]:
-    """POST to the Yandex Music internal API to fetch track metadata.
-
-    This is the same endpoint the mobile app uses.  It works without
-    authentication for basic track info.
-    """
+    """POST to the Yandex Music internal API (same endpoint the mobile app uses)."""
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -111,7 +165,7 @@ async def _fetch_via_api(track_id: str) -> Optional[dict]:
             ) as resp:
                 if resp.status != 200:
                     logger.warning(
-                        "Yandex API returned HTTP %d for track_id=%s",
+                        "API returned HTTP %d for track_id=%s",
                         resp.status,
                         track_id,
                     )
@@ -122,23 +176,32 @@ async def _fetch_via_api(track_id: str) -> Optional[dict]:
                 if not result:
                     return None
 
-                return _parse_api_track(result[0])
+                return _parse_track(result[0])
 
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Yandex API request failed for track_id=%s: %s", track_id, exc)
+        logger.warning("API request failed for track_id=%s: %s", track_id, exc)
         return None
 
 
-def _parse_api_track(track: dict) -> dict:
-    """Extract title, artist, and duration from a raw API track object."""
+# ---------------------------------------------------------------------------
+# Shared track parser
+# ---------------------------------------------------------------------------
+
+def _parse_track(track: dict) -> dict:
+    """Extract title, artist, and duration from a raw track JSON object.
+
+    Works with both handler and API response shapes — both use the same
+    field names (``title``, ``artists``, ``durationMs``).
+    """
+    # Duration: ms → MM:SS
     duration_ms: int = track.get("durationMs", 0)
     duration_sec = duration_ms // 1000
     minutes, seconds = divmod(duration_sec, 60)
 
+    # Artists — may be a list of objects with a "name" field
+    artists_raw = track.get("artists", [])
     artists = ", ".join(
-        a.get("name", "")
-        for a in track.get("artists", [])
-        if a.get("name")
+        a.get("name", "") for a in artists_raw if a.get("name")
     )
 
     return {
@@ -146,79 +209,3 @@ def _parse_api_track(track: dict) -> dict:
         "artist": artists or "Unknown artist",
         "duration": f"{minutes:02d}:{seconds:02d}",
     }
-
-
-# ---------------------------------------------------------------------------
-# Strategy 2: Page scraping (OG meta tags)
-# ---------------------------------------------------------------------------
-
-async def _fetch_via_page(track_id: str) -> Optional[dict]:
-    """GET the track page and extract metadata from OG meta tags."""
-    url = f"https://music.yandex.ru/track/{track_id}"
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                url,
-                headers=_PAGE_HEADERS,
-                timeout=_TIMEOUT,
-                allow_redirects=True,
-            ) as resp:
-                if resp.status != 200:
-                    logger.warning(
-                        "Track page returned HTTP %d for %s", resp.status, url
-                    )
-                    return None
-
-                page = await resp.text()
-                return _parse_page(page)
-
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Page scraping failed for track_id=%s: %s", track_id, exc)
-        return None
-
-
-def _parse_page(page: str) -> Optional[dict]:
-    """Extract track info from OG meta tags or the ``<title>`` element."""
-    og = _extract_og_tags(page)
-
-    title = og.get("title")
-    artist = og.get("description")
-
-    # Fallback: parse <title> — usually "Song — Artist слушать ..."
-    if not title:
-        m = re.search(r"<title>(.+?)</title>", page, re.I | re.S)
-        if m:
-            raw = html.unescape(m.group(1).strip())
-            parts = raw.split("—", 1)
-            title = parts[0].strip()
-            if len(parts) >= 2:
-                # Remove "слушать онлайн ..." suffix
-                artist = re.split(r"\s+слушать", parts[1], maxsplit=1)[0].strip()
-
-    if not title:
-        return None
-
-    return {
-        "title": html.unescape(title),
-        "artist": html.unescape(artist) if artist else "Unknown artist",
-        "duration": "—",  # not available from page HTML
-    }
-
-
-def _extract_og_tags(page: str) -> dict[str, str]:
-    """Return a dict of ``{property: content}`` for all ``og:*`` meta tags."""
-    tags: dict[str, str] = {}
-
-    # <meta property="og:title" content="...">  (property first)
-    for prop, content in re.findall(
-        r'<meta[^>]+property="og:([^"]+)"[^>]+content="([^"]*)"', page, re.I
-    ):
-        tags[prop] = content
-
-    # <meta content="..." property="og:title">  (content first)
-    for content, prop in re.findall(
-        r'<meta[^>]+content="([^"]*)"[^>]+property="og:([^"]+)"', page, re.I
-    ):
-        tags.setdefault(prop, content)
-
-    return tags
