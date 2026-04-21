@@ -36,6 +36,7 @@ YANDEX_TRACK_PATTERN = re.compile(r"track/(\d+)")
 _HANDLER_URL = "https://music.yandex.ru/handlers/track.jsx"
 _API_URL = "https://api.music.yandex.net/tracks"
 _SUPPLEMENT_URL = "https://api.music.yandex.net/tracks/{track_id}/supplement"
+_LRCLIB_URL = "https://lrclib.net/api/search"
 
 _BROWSER_HEADERS = {
     "User-Agent": (
@@ -148,7 +149,18 @@ async def _fetch_via_handler(track_id: str) -> Optional[dict]:
                 # Check if lyrics are available and fetch them
                 lyrics_info = track.get("lyricsInfo", {})
                 if lyrics_info.get("hasAvailableTextLyrics"):
-                    result["lyrics"] = await _fetch_lyrics(track_id)
+                    # Try Yandex supplement first, fall back to lrclib.net
+                    lyrics = await _fetch_lyrics(track_id)
+                    if not lyrics:
+                        logger.info(
+                            "Yandex lyrics unavailable for track_id=%s, "
+                            "trying lrclib.net",
+                            track_id,
+                        )
+                        lyrics = await _fetch_lyrics_lrclib(
+                            result["title"], result["artist"]
+                        )
+                    result["lyrics"] = lyrics
 
                 return result
 
@@ -223,6 +235,62 @@ async def _fetch_lyrics(track_id: str) -> Optional[str]:
 
     except Exception as exc:  # noqa: BLE001
         logger.warning("Lyrics fetch failed for track_id=%s: %s", track_id, exc)
+        return None
+
+
+async def _fetch_lyrics_lrclib(title: str, artist: str) -> Optional[str]:
+    """Search lrclib.net for plain lyrics by title + artist.
+
+    lrclib.net is a free, public lyrics API with no geo-restrictions.
+    Returns the ``plainLyrics`` from the first non-instrumental match,
+    or ``None`` if nothing is found.
+    """
+    params = {
+        "track_name": title,
+        "artist_name": artist,
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                _LRCLIB_URL,
+                params=params,
+                headers={"User-Agent": "UpsoundBot/1.0"},
+                timeout=_TIMEOUT,
+            ) as resp:
+                if resp.status != 200:
+                    logger.warning(
+                        "lrclib.net returned HTTP %d for '%s - %s'",
+                        resp.status,
+                        artist,
+                        title,
+                    )
+                    return None
+
+                results = await resp.json()
+                if not results or not isinstance(results, list):
+                    return None
+
+                # Pick the first result that has plainLyrics
+                for hit in results:
+                    text = (hit.get("plainLyrics") or "").strip()
+                    if text:
+                        logger.info(
+                            "lrclib.net lyrics found for '%s - %s'",
+                            artist,
+                            title,
+                        )
+                        return text
+
+                return None
+
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "lrclib.net request failed for '%s - %s': %s",
+            artist,
+            title,
+            exc,
+        )
         return None
 
 
