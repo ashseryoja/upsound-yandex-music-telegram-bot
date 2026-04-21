@@ -89,9 +89,16 @@ class handler(BaseHTTPRequestHandler):
             update = Update.model_validate(raw)
 
             # Run the async dispatcher in a fresh event loop.
-            # Vercel Python workers are synchronous; asyncio.run() is the
-            # safest way to drive the coroutine to completion.
-            asyncio.run(dp.feed_update(bot=bot, update=update))
+            # We must create a NEW loop every time because Vercel reuses
+            # the same process across warm invocations, and asyncio.run()
+            # closes the loop after completion — a subsequent call would
+            # hit "Event loop is closed".
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(dp.feed_update(bot=bot, update=update))
+            finally:
+                loop.close()
 
             self._respond(200, b"ok")
 
