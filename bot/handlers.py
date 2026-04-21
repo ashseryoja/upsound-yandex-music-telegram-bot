@@ -33,10 +33,7 @@ router = Router(name="main")
 async def handle_start(message: types.Message) -> None:
     await message.answer(
         "👋 <b>Upsound Bot</b>\n\n"
-        "Send me a <b>Yandex Music</b> track link and I'll show you its details.\n\n"
-        "Supported formats:\n"
-        "• <code>https://music.yandex.ru/album/&lt;id&gt;/track/&lt;id&gt;</code>\n"
-        "• <code>https://music.yandex.ru/track/&lt;id&gt;</code>",
+        "Пришлите мне ссылку на трек в Яндекс Музыке, и я покажу вам его характеристики.",
         parse_mode=ParseMode.HTML,
     )
 
@@ -123,6 +120,6 @@ async def handle_yandex_link(message: types.Message) -> None:
 @router.message()
 async def handle_unknown(message: types.Message) -> None:
     await message.reply(
-        "Please send me a Yandex Music track link. "
-        "Use /start to see supported formats."
+        "Пришлите мне ссылку на трек в Яндекс Музыке. "
+        "Используйте /start, чтобы увидеть поддерживаемые форматы."
     )
